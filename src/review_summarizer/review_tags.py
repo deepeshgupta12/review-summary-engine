@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import pandas as pd
 from rich import print
@@ -12,9 +13,8 @@ from rich.progress import track
 from review_summarizer.config import Settings
 from review_summarizer.io import read_reviews_csv
 from review_summarizer.openai_client import build_client, responses_parse
-from review_summarizer.resume import load_processed_project_ids  # kept for backwards compat; not used here
 from review_summarizer.review_uid import make_review_uid
-from review_summarizer.tag_schemas import ReviewTagBatch, ReviewTagItem
+from review_summarizer.tag_schemas import ReviewTagBatch
 from review_summarizer.tokenizer import count_tokens
 
 
@@ -22,13 +22,16 @@ SYSTEM_TAGS = """You generate exactly 3 short UI tags for each user review of a 
 
 Hard rules:
 - Output EXACTLY 3 tags per review.
-- Each tag is 2–4 words, Title Case, max 28 characters.
+- Each tag is 2–4 words.
+- Title Case.
 - No emojis.
 - No personal names.
 - Tags must be grounded ONLY in what the review text says.
 - Tags should capture: (1) Persona/Intent, (2) Primary USP, (3) Secondary USP or Experience.
 - Avoid harsh negativity; if needed, phrase as neutral ("Needs Better Maintenance", "Traffic Consideration").
 
+Important:
+- Keep tags short; aim <= 28 characters.
 Return structured output exactly matching the schema.
 """
 
@@ -70,23 +73,59 @@ def _rebuild_csv_from_jsonl(jsonl_file: Path, csv_file: Path) -> None:
     pd.DataFrame(records).to_csv(csv_file, index=False, encoding="utf-8")
 
 
-def _sanitize_tag(tag: str) -> str:
+def _title_case_preserve_acronyms(s: str) -> str:
+    words = [w for w in re.split(r"\s+", s.strip()) if w]
+    out = []
+    for w in words:
+        # keep acronyms like "UPI", "RERA" as-is
+        if len(w) <= 5 and w.isupper():
+            out.append(w)
+        elif w.islower():
+            out.append(w[:1].upper() + w[1:])
+        else:
+            out.append(w[:1].upper() + w[1:])
+    return " ".join(out)
+
+
+def _clean_tag(tag: str) -> str:
     tag = (tag or "").strip().strip('"').strip("'")
-    # Title-case without overdoing acronyms
-    words = [w for w in tag.split() if w]
-    return " ".join([w[:1].upper() + w[1:] if w.islower() else w for w in words])
+    tag = re.sub(r"[^\w\s&/-]", "", tag)  # remove weird punctuation, keep &, /, -
+    tag = re.sub(r"\s+", " ", tag).strip()
+    tag = _title_case_preserve_acronyms(tag)
+    return tag
+
+
+def _shorten_tag(tag: str, max_len: int = 28) -> str:
+    """
+    Enforce UI max length without breaking too much meaning.
+    - Try removing filler words
+    - Then truncate cleanly
+    """
+    tag = _clean_tag(tag)
+    if len(tag) <= max_len:
+        return tag
+
+    filler = {"Very", "Highly", "Really", "Quite", "Mostly", "Generally", "Appreciating", "Noting", "Finding"}
+    parts = [p for p in tag.split() if p not in filler]
+    tag2 = " ".join(parts).strip()
+    if tag2 and len(tag2) <= max_len:
+        return tag2
+
+    # Truncate to max_len at word boundary
+    if len(tag2) > max_len:
+        tag2 = tag2[:max_len].rstrip()
+    if len(tag2) < 6:  # too short to be meaningful after truncation
+        tag2 = tag[:max_len].rstrip()
+
+    return tag2
 
 
 def _pack_reviews_for_batch(reviews: List[Dict[str, Any]], max_tokens: int) -> List[List[Dict[str, Any]]]:
-    """
-    Packs review dicts into multiple batches based on token estimate of JSON payload.
-    """
     batches: List[List[Dict[str, Any]]] = []
     buf: List[Dict[str, Any]] = []
     buf_tokens = 0
 
     for r in reviews:
-        # token estimate of the review payload
         payload = json.dumps(r, ensure_ascii=False)
         t = count_tokens(payload)
 
@@ -102,6 +141,37 @@ def _pack_reviews_for_batch(reviews: List[Dict[str, Any]], max_tokens: int) -> L
         batches.append(buf)
 
     return batches
+
+
+def _regen_single_review_tags(*, client, model: str, temperature: float, review_obj: Dict[str, Any]) -> List[str]:
+    """
+    If post-processing still violates constraints, regenerate strictly for a single review.
+    """
+    strict_system = SYSTEM_TAGS + "\nSTRICT: Each tag MUST be <= 28 characters. No exceptions."
+    one_prompt = f"""Generate tags for this single review.
+
+InputReviewJSON:
+{json.dumps(review_obj, ensure_ascii=False)}
+
+Return:
+- items: array with exactly 1 object for this review_uid.
+"""
+    resp = responses_parse(
+        client=client,
+        model=model,
+        input_messages=[
+            {"role": "system", "content": strict_system},
+            {"role": "user", "content": one_prompt},
+        ],
+        text_format=ReviewTagBatch,
+        temperature=temperature,
+    )
+    parsed: ReviewTagBatch = resp.output_parsed
+    raw = parsed.items[0].tags
+    fixed = [_shorten_tag(t, 28) for t in raw]
+    # Final hard clamp
+    fixed = [t[:28].rstrip() for t in fixed]
+    return fixed
 
 
 def generate_review_tags(
@@ -122,11 +192,9 @@ def generate_review_tags(
 
     df, cols = read_reviews_csv(csv_path)
 
-    # Optional filter to a project
     if only_project_id:
         df = df[df[cols.project_id].astype(str) == str(only_project_id)]
 
-    # Optional row limit (cost control)
     if limit_rows is not None:
         df = df.head(limit_rows)
 
@@ -138,44 +206,32 @@ def generate_review_tags(
             if fp.exists():
                 fp.unlink()
 
+    df["_review_uid"] = df.apply(
+        lambda r: make_review_uid(
+            project_id=str(r[cols.project_id]),
+            user_id=r["UserId"] if "UserId" in df.columns else None,
+            created_on=r["CreatedOn"] if "CreatedOn" in df.columns else None,
+            description=r[cols.review_text],
+        ),
+        axis=1,
+    )
+
     processed = _load_processed_review_uids(jsonl_file) if resume else set()
     if resume and processed:
         before = len(df)
-        # create uids first to filter
-        df["_review_uid"] = df.apply(
-            lambda r: make_review_uid(
-                project_id=str(r[cols.project_id]),
-                user_id=r["UserId"] if "UserId" in df.columns else None,
-                created_on=r["CreatedOn"] if "CreatedOn" in df.columns else None,
-                description=r[cols.review_text],
-            ),
-            axis=1,
-        )
         df = df[~df["_review_uid"].isin(processed)]
         after = len(df)
         print(f"[bold]Resume:[/bold] skipping {before - after} already processed reviews.")
-    else:
-        df["_review_uid"] = df.apply(
-            lambda r: make_review_uid(
-                project_id=str(r[cols.project_id]),
-                user_id=r["UserId"] if "UserId" in df.columns else None,
-                created_on=r["CreatedOn"] if "CreatedOn" in df.columns else None,
-                description=r[cols.review_text],
-            ),
-            axis=1,
-        )
 
     if len(df) == 0:
         print("[yellow]Nothing to process (all done or filtered out).[/yellow]")
         return
 
-    # Prepare review payloads
     payloads: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         text = str(r[cols.review_text]).strip()
         if not text:
             continue
-
         payloads.append({
             "review_uid": str(r["_review_uid"]),
             "project_id": str(r[cols.project_id]),
@@ -185,7 +241,6 @@ def generate_review_tags(
             "review_text": text,
         })
 
-    # Optional batch limit (process N reviews then exit)
     if batch_size is not None:
         payloads = payloads[:batch_size]
 
@@ -193,9 +248,9 @@ def generate_review_tags(
         print("[yellow]No non-empty reviews to process.[/yellow]")
         return
 
-    # Pack into API batches by token estimate; also enforce max reviews per batch from env
     packed = _pack_reviews_for_batch(payloads, max_tokens=settings.tag_batch_tokens)
-    # Further split if a packed batch exceeds max reviews
+
+    # Also cap count per batch
     final_batches: List[List[Dict[str, Any]]] = []
     for b in packed:
         for i in range(0, len(b), settings.tag_batch_max_reviews):
@@ -213,7 +268,6 @@ Return:
 - items: array of objects, each with review_uid and tags (exactly 3 tags).
 - One output per input review_uid.
 """
-
         resp = responses_parse(
             client=client,
             model=settings.model,
@@ -226,53 +280,53 @@ Return:
         )
 
         parsed: ReviewTagBatch = resp.output_parsed
+        out_map: Dict[str, List[str]] = {}
 
-        # Map results by uid
-        out_map: Dict[str, ReviewTagItem] = {it.review_uid: it for it in parsed.items}
+        for it in parsed.items:
+            raw_tags = it.tags
+            fixed = [_shorten_tag(t, 28) for t in raw_tags]
+            fixed = [t[:28].rstrip() for t in fixed]  # final clamp
+            out_map[it.review_uid] = fixed
 
-        # Validate completeness; if missing, retry missing ones individually (strict)
+        # Ensure every input uid got output; regenerate missing individually
         missing = [x for x in b if x["review_uid"] not in out_map]
         if missing:
             print(f"[yellow]Batch missing {len(missing)} items. Retrying individually.[/yellow]")
             for one in missing:
-                one_prompt = f"""Generate tags for this single review.
-
-InputReviewJSON:
-{json.dumps(one, ensure_ascii=False)}
-
-Return:
-- items: array with exactly 1 object for this review_uid.
-"""
-                resp_one = responses_parse(
+                fixed = _regen_single_review_tags(
                     client=client,
                     model=settings.model,
-                    input_messages=[
-                        {"role": "system", "content": SYSTEM_TAGS},
-                        {"role": "user", "content": one_prompt},
-                    ],
-                    text_format=ReviewTagBatch,
                     temperature=settings.tag_temperature,
+                    review_obj=one,
                 )
-                parsed_one: ReviewTagBatch = resp_one.output_parsed
-                if parsed_one.items:
-                    out_map[parsed_one.items[0].review_uid] = parsed_one.items[0]
+                out_map[one["review_uid"]] = fixed
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
-        # Write outputs line-by-line for resume safety
-        with jsonl_file.open("a", encoding="utf-8") as f:
-            for inp in b:
-                uid = inp["review_uid"]
-                if uid not in out_map:
-                    continue
-                tags = [_sanitize_tag(t) for t in out_map[uid].tags]
+        # If any tags still violate length or emptiness, regenerate individually (rare)
+        for one in b:
+            uid = one["review_uid"]
+            tags = out_map.get(uid)
+            if not tags or len(tags) != 3 or any((not t.strip()) for t in tags) or any(len(t) > 28 for t in tags):
+                out_map[uid] = _regen_single_review_tags(
+                    client=client,
+                    model=settings.model,
+                    temperature=settings.tag_temperature,
+                    review_obj=one,
+                )
 
+        with jsonl_file.open("a", encoding="utf-8") as f:
+            for one in b:
+                uid = one["review_uid"]
+                tags = out_map.get(uid)
+                if not tags:
+                    continue
                 rec = {
                     "review_uid": uid,
-                    "project_id": inp["project_id"],
-                    "project_name": inp["project_name"],
-                    "rating": inp.get("rating"),
-                    "created_on": inp.get("created_on"),
+                    "project_id": one["project_id"],
+                    "project_name": one["project_name"],
+                    "rating": one.get("rating"),
+                    "created_on": one.get("created_on"),
                     "tag_1": tags[0],
                     "tag_2": tags[1],
                     "tag_3": tags[2],
