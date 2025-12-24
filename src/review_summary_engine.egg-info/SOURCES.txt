@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 src/review_summarizer/__init__.py
 src/review_summarizer/config.py
+src/review_summarizer/exporter.py
 src/review_summarizer/io.py
 src/review_summarizer/openai_client.py
 src/review_summarizer/project_summary.py
