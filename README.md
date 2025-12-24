@@ -325,8 +325,3 @@ python scripts/generate_review_tags.py --csv "data/in/reviews.csv" --out "data/o
 - ✅ FastAPI service wrapper (`/summaries`, `/tags`, `/project-pack/<id>`)
 - ✅ Optional caching layer (e.g., SQLite / DuckDB) to speed incremental runs
 - ✅ Automated eval checks (tag validity, summary consistency, profanity filtering)
-
----
-
-## 📄 License
-Internal / private usage unless you add a license explicitly.
